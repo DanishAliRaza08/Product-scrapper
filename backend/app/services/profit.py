@@ -93,6 +93,8 @@ def calculate(inputs: CostInputs) -> ProfitResult:
     fees = inputs.fees
     if inputs.marketplace_fees_override is None and fees is None:
         missing.append("marketplace_fees")
+    # Profit-derived figures need every cost input: an unknown cost is never treated as zero.
+    costs_known = "supplier_cost" not in missing and "marketplace_fees" not in missing
 
     k = (Decimal(1) / (1 + inputs.tax_rate)) if inputs.prices_include_tax else Decimal(1)
     if inputs.prices_include_tax and inputs.tax_rate:
@@ -135,8 +137,8 @@ def calculate(inputs: CostInputs) -> ProfitResult:
             None,
             None,
             None,
-            break_even if inputs.supplier_cost is not None else None,
-            target_price if inputs.supplier_cost is not None else None,
+            break_even if costs_known else None,
+            target_price if costs_known else None,
             False,
             missing,
             assumptions,
@@ -164,12 +166,12 @@ def calculate(inputs: CostInputs) -> ProfitResult:
         marketplace_fees=q(mkt_fees),
         payment_fees=q(pay_fees),
         returns_allowance=q(returns),
-        total_cost=q(total),
-        profit=q(profit),
-        margin_pct=q(margin),
-        roi_pct=q(roi),
-        break_even_price=break_even,
-        target_margin_price=target_price,
+        total_cost=q(total) if costs_known else None,
+        profit=q(profit) if costs_known else None,
+        margin_pct=q(margin) if costs_known else None,
+        roi_pct=q(roi) if costs_known else None,
+        break_even_price=break_even if costs_known else None,
+        target_margin_price=target_price if costs_known else None,
         is_complete=not missing,
         missing_inputs=missing,
         assumptions=assumptions,

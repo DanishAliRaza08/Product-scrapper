@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.core.pagination import decode_cursor, encode_cursor
-from app.models import Listing, Marketplace, ProjectProduct
+from app.models import JobItem, Listing, Marketplace, ProjectProduct
 
 # name -> (column, direction, nullable)
 SORTS = {
@@ -44,6 +44,7 @@ class ProductFilters(BaseModel):
     project_id: uuid.UUID | None = None
     tag: str | None = None
     canonical_product_id: int | None = None
+    job_id: uuid.UUID | None = None
     has_gtin: bool | None = None
     watched: bool | None = None
     updated_since: datetime | None = None
@@ -97,6 +98,12 @@ def build_query(organisation_id: uuid.UUID, f: ProductFilters, *, can_view_own: 
         if f.tag:
             pp = pp.where(ProjectProduct.tags.any(f.tag))
         stmt = stmt.where(Listing.id.in_(pp))
+    if f.job_id is not None:
+        stmt = stmt.where(
+            Listing.id.in_(
+                select(JobItem.listing_id).where(JobItem.job_id == f.job_id, JobItem.listing_id.is_not(None))
+            )
+        )
     if f.canonical_product_id is not None:
         stmt = stmt.where(Listing.canonical_product_id == f.canonical_product_id)
     if f.has_gtin is not None:

@@ -71,13 +71,21 @@ def competition_score(review_count: int | None, offer_count: int | None, matched
         "competition",
         0,
         mean(parts),
-        f"reviews={review_count}, offers={offer_count}, cross-market listings={matched_listings}",
+        ", ".join(
+            f"{name} {value:,}"
+            for name, value in (
+                ("reviews", review_count),
+                ("offers", offer_count),
+                ("cross-market listings", matched_listings),
+            )
+            if value is not None
+        ),
     )
 
 
 def margin_score(margin_pct: Decimal | None) -> Component:
     if margin_pct is None:
-        return Component("profit_margin", 0, None, "Add supplier cost and fees to score margin")
+        return Component("profit_margin", 0, None, "Needs supplier cost and a fee profile")
     return Component("profit_margin", 0, _clamp(float(margin_pct) * 2.5), f"Estimated margin {margin_pct}%")
 
 

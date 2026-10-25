@@ -170,7 +170,10 @@ def opportunity(db: Session, organisation_id: uuid.UUID, listing: Listing) -> sc
         )
     )
     image_count = db.scalar(select(func.count()).select_from(Image).where(Image.listing_id == listing.id)) or 0
-    margin = listing_profit(db, organisation_id, listing).margin_pct
+    # Only a complete calculation may score margin: a missing supplier cost or fee
+    # schedule must not be treated as zero (that would inflate the score).
+    profit_result = listing_profit(db, organisation_id, listing)
+    margin = profit_result.margin_pct if profit_result.is_complete else None
     cost = latest_cost(db, organisation_id, listing)
     attrs = (cost.assessment if cost else None) or {}
     components = [

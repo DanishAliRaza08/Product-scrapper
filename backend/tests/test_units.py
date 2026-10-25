@@ -151,8 +151,10 @@ def test_profit_guards_and_missing_inputs():
     r = profit.calculate(profit.CostInputs(selling_price=Decimal("0"), supplier_cost=Decimal("0")))
     assert r.margin_pct is None and r.roi_pct is None
     assert "marketplace_fees" in r.missing_inputs and not r.is_complete
-    r = profit.calculate(profit.CostInputs(selling_price=Decimal("10")))
+    r = profit.calculate(profit.CostInputs(selling_price=Decimal("10"), fees=profit.FeeInputs()))
     assert "supplier_cost" in r.missing_inputs
+    assert r.profit is None and r.margin_pct is None and r.break_even_price is None  # unknown cost is not zero
+    assert r.net_revenue == Decimal("10.00")
     # fees consume the whole price: no break-even exists
     r = profit.calculate(
         profit.CostInputs(supplier_cost=Decimal("1"), fees=profit.FeeInputs(referral_rate=Decimal("1")))

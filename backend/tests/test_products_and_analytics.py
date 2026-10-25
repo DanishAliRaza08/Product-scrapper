@@ -250,3 +250,20 @@ def test_overview_uses_materialised_view_for_large_orgs(client, admin, monkeypat
     assert pre["aggregates_as_of"] is not None
     assert pre["total_listings"] == live["total_listings"]
     assert pre["stock_status"] == live["stock_status"]
+
+
+def test_filter_products_by_job(client, admin):
+    h = admin["headers"]
+    a = run_keyword_job(client, h, keyword="yoga", limit=10)
+    run_keyword_job(client, h, keyword="knife", limit=10)
+    items = client.get(f"/api/v1/products?job_id={a['id']}&limit=200", headers=h).json()["items"]
+    assert len(items) == a["products_processed"]
+
+
+def test_incomplete_costs_do_not_score_margin(client, admin):
+    h = admin["headers"]
+    run_keyword_job(client, h, keyword="mat", limit=3)
+    pid = client.get("/api/v1/products?limit=1", headers=h).json()["items"][0]["id"]
+    opp = client.get(f"/api/v1/products/{pid}/opportunity", headers=h).json()
+    margin = next(c for c in opp["components"] if c["name"] == "profit_margin")
+    assert margin["score"] is None and "profit_margin" in opp["missing"]
