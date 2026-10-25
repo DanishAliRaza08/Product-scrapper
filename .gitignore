@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+backend/var/
+node_modules/
+web/.next/
+web/out/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+*.log
+.DS_Store
