@@ -30,6 +30,7 @@ celery_app.conf.update(
         },
         "expire-exports": {"task": "app.workers.tasks.expire_exports_task", "schedule": crontab(hour=3, minute=0)},
         "fx-rates": {"task": "app.workers.tasks.refresh_fx_task", "schedule": crontab(hour=16, minute=30)},
+        "dashboard-aggregates": {"task": "app.workers.tasks.refresh_summary_view_task", "schedule": 600.0},
         "connector-health": {"task": "app.workers.tasks.connector_health_task", "schedule": 600.0},
     },
 )

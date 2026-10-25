@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, text
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -22,7 +22,110 @@ from app.models import (
 PRICE_BANDS = [0, 10, 25, 50, 100, 250, 500]
 
 
+# Above this many listings the dashboard reads the pre-aggregated materialised view.
+MV_THRESHOLD = 50_000
+
+
+def _mv_overview(db: Session, organisation_id: uuid.UUID, include_own: bool) -> dict | None:
+    scope = "organisation_id = :org" + ("" if include_own else " AND source_type <> 'own_account'")
+    params = {"org": organisation_id}
+    total = db.execute(
+        text(f"SELECT sum(listings), min(refreshed_at) FROM mv_listing_summary WHERE {scope}"),  # noqa: S608
+        params,
+    ).one()
+    if not total[0] or total[0] < MV_THRESHOLD:
+        return None
+
+    def q(sql: str):
+        return db.execute(text(sql.format(scope=scope)), params).all()
+
+    by_marketplace = [
+        {
+            "marketplace": code,
+            "name": name,
+            "country": country,
+            "listings": int(n),
+            "avg_price": str(round(ps / pc, 2)) if pc else None,
+            "currency": currency,
+        }
+        for code, name, country, currency, n, ps, pc in q(
+            "SELECT m.code, m.name, m.country_code, m.currency_code, sum(s.listings), sum(s.price_sum), sum(s.priced) "
+            "FROM mv_listing_summary s JOIN marketplaces m ON m.id = s.marketplace_id WHERE {scope} "
+            "GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC"
+        )
+    ]
+    return {
+        "by_marketplace": by_marketplace,
+        "stock_status": {
+            k: int(v)
+            for k, v in q("SELECT stock_status, sum(listings) FROM mv_listing_summary WHERE {scope} GROUP BY 1")
+        },
+        "price_bands": [
+            {"band": b, "currency": c, "listings": int(n)}
+            for b, c, n in q(
+                "SELECT price_band, currency_code, sum(listings) FROM mv_listing_summary "
+                "WHERE {scope} AND price_band IS NOT NULL GROUP BY 1, 2"
+            )
+        ],
+        "top_categories": [
+            {"category": c, "listings": int(n)}
+            for c, n in q(
+                "SELECT category_path, sum(listings) FROM mv_listing_summary WHERE {scope} GROUP BY 1 ORDER BY 2 DESC "
+                "LIMIT 10"
+            )
+        ],
+        "changed_last_24h": int(q("SELECT coalesce(sum(changed_24h), 0) FROM mv_listing_summary WHERE {scope}")[0][0]),
+        "stale_over_7_days": int(q("SELECT coalesce(sum(stale_7d), 0) FROM mv_listing_summary WHERE {scope}")[0][0]),
+        "aggregates_as_of": total[1].isoformat() if total[1] else None,
+    }
+
+
+def refresh_summary_view(db: Session) -> None:
+    db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_listing_summary"))
+
+
 def overview(db: Session, organisation_id: uuid.UUID, *, include_own: bool) -> dict:
+    data = _mv_overview(db, organisation_id, include_own) or _live_overview(db, organisation_id, include_own)
+    base = Listing.organisation_id == organisation_id
+    scope = [base] if include_own else [base, Listing.source_type != "own_account"]
+    if data["aggregates_as_of"] is not None:
+        sources = {
+            k: int(v)
+            for k, v in db.execute(
+                text("SELECT source_type, sum(listings) FROM mv_listing_summary WHERE organisation_id = :o GROUP BY 1"),
+                {"o": organisation_id},
+            )
+        }
+    else:
+        sources = dict(
+            db.execute(select(Listing.source_type, func.count()).where(base).group_by(Listing.source_type)).all()
+        )
+    if not include_own:
+        sources.pop("own_account", None)
+    measurement = dict(
+        db.execute(
+            select(ProductMetric.measurement_type, func.count(func.distinct(ProductMetric.listing_id)))
+            .join(Listing, Listing.id == ProductMetric.listing_id)
+            .where(*scope)
+            .group_by(ProductMetric.measurement_type)
+        ).all()
+    )
+    jobs = dict(
+        db.execute(
+            select(Job.job_status, func.count()).where(Job.organisation_id == organisation_id).group_by(Job.job_status)
+        ).all()
+    )
+    return {
+        "total_listings": sum(m["listings"] for m in data["by_marketplace"]),
+        **data,
+        "source_types": sources,
+        "listings_with_metrics": measurement,
+        "jobs": jobs,
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _live_overview(db: Session, organisation_id: uuid.UUID, include_own: bool) -> dict:
     base = Listing.organisation_id == organisation_id
     scope = [base] if include_own else [base, Listing.source_type != "own_account"]
     by_marketplace = [
@@ -56,11 +159,6 @@ def overview(db: Session, organisation_id: uuid.UUID, *, include_own: bool) -> d
             .group_by(Listing.stock_status)
         ).all()
     )
-    sources = dict(
-        db.execute(select(Listing.source_type, func.count()).where(base).group_by(Listing.source_type)).all()
-    )
-    if not include_own:
-        sources.pop("own_account", None)
     band_expr = case(
         *[(Listing.current_price < hi, f"{lo}-{hi}") for lo, hi in zip(PRICE_BANDS, PRICE_BANDS[1:], strict=False)],
         else_=f"{PRICE_BANDS[-1]}+",
@@ -84,35 +182,15 @@ def overview(db: Session, organisation_id: uuid.UUID, *, include_own: bool) -> d
         )
     ]
     day_ago = datetime.now(UTC) - timedelta(days=1)
-    changed_24h = db.scalar(select(func.count()).where(*scope, Listing.last_changed_at >= day_ago)) or 0
-    stale = (
-        db.scalar(select(func.count()).where(*scope, Listing.last_seen_at < datetime.now(UTC) - timedelta(days=7))) or 0
-    )
-    measurement = dict(
-        db.execute(
-            select(ProductMetric.measurement_type, func.count(func.distinct(ProductMetric.listing_id)))
-            .join(Listing, Listing.id == ProductMetric.listing_id)
-            .where(*scope)
-            .group_by(ProductMetric.measurement_type)
-        ).all()
-    )
-    jobs = dict(
-        db.execute(
-            select(Job.job_status, func.count()).where(Job.organisation_id == organisation_id).group_by(Job.job_status)
-        ).all()
-    )
+    week_ago = datetime.now(UTC) - timedelta(days=7)
     return {
-        "total_listings": sum(m["listings"] for m in by_marketplace),
         "by_marketplace": by_marketplace,
         "stock_status": stock,
-        "source_types": sources,
         "price_bands": price_bands,
         "top_categories": categories,
-        "changed_last_24h": changed_24h,
-        "stale_over_7_days": stale,
-        "listings_with_metrics": measurement,
-        "jobs": jobs,
-        "generated_at": datetime.now(UTC).isoformat(),
+        "changed_last_24h": db.scalar(select(func.count()).where(*scope, Listing.last_changed_at >= day_ago)) or 0,
+        "stale_over_7_days": db.scalar(select(func.count()).where(*scope, Listing.last_seen_at < week_ago)) or 0,
+        "aggregates_as_of": None,
     }
 
 

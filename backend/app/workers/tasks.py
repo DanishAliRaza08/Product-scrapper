@@ -94,3 +94,11 @@ def connector_health_task() -> dict:
                 )
             )
     return results
+
+
+@celery_app.task
+def refresh_summary_view_task() -> None:
+    from app.services.analytics import refresh_summary_view
+
+    with session_scope() as db:
+        refresh_summary_view(db)

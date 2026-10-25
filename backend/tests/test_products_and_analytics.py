@@ -215,3 +215,38 @@ def test_viewer_cannot_export_or_see_others_exports(client, admin):
     assert client.post("/api/v1/exports", headers=viewer, json={}).status_code == 403
     r = client.post("/api/v1/exports", headers=admin["headers"], json={"export_format": "csv"})
     assert client.get(f"/api/v1/exports/{r.json()['id']}", headers=viewer).status_code == 403
+
+
+def test_pagination_includes_rows_without_sort_value(client, admin):
+    h = admin["headers"]
+    run_keyword_job(client, h, keyword="yoga", limit=30)
+    with session_scope() as db:
+        db.execute(text("UPDATE marketplace_listings SET current_price = NULL, sales_rank = NULL WHERE id % 3 = 0"))
+    for sort in ("price_asc", "price_desc", "rank", "title", "updated"):
+        seen, cursor = [], None
+        while True:
+            page = client.get(
+                f"/api/v1/products?limit=7&sort={sort}" + (f"&cursor={cursor}" if cursor else ""), headers=h
+            ).json()
+            seen += [i["id"] for i in page["items"]]
+            cursor = page["next_cursor"]
+            if not cursor:
+                break
+        total = client.get("/api/v1/products?with_total=true&limit=1", headers=h).json()["total"]
+        assert len(seen) == len(set(seen)) == total, sort
+
+
+def test_overview_uses_materialised_view_for_large_orgs(client, admin, monkeypatch):
+    from app.services import analytics
+
+    h = admin["headers"]
+    run_keyword_job(client, h, keyword="yoga", limit=20)
+    live = client.get("/api/v1/analytics/overview", headers=h).json()
+    assert live["aggregates_as_of"] is None
+    with session_scope() as db:
+        analytics.refresh_summary_view(db)
+    monkeypatch.setattr(analytics, "MV_THRESHOLD", 1)
+    pre = client.get("/api/v1/analytics/overview", headers=h).json()
+    assert pre["aggregates_as_of"] is not None
+    assert pre["total_listings"] == live["total_listings"]
+    assert pre["stock_status"] == live["stock_status"]

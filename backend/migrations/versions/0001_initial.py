@@ -67,6 +67,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _execute_raw("DROP MATERIALIZED VIEW IF EXISTS mv_listing_summary;")
     _execute_raw("DROP FUNCTION IF EXISTS ensure_observation_partitions(INTEGER);")
     for table in TABLES:
         _execute_raw(f"DROP TABLE IF EXISTS {table} CASCADE;")

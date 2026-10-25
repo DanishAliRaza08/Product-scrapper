@@ -8,20 +8,21 @@ from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, func, literal, or_, select, tuple_
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.core.pagination import decode_cursor, encode_cursor
 from app.models import Listing, Marketplace, ProjectProduct
 
+# name -> (column, direction, nullable)
 SORTS = {
-    "updated": (Listing.updated_at, "desc"),
-    "price_asc": (Listing.current_price, "asc"),
-    "price_desc": (Listing.current_price, "desc"),
-    "rank": (Listing.sales_rank, "asc"),
-    "reviews": (Listing.review_count, "desc"),
-    "title": (Listing.title, "asc"),
+    "updated": (Listing.updated_at, "desc", False),
+    "price_asc": (Listing.current_price, "asc", True),
+    "price_desc": (Listing.current_price, "desc", True),
+    "rank": (Listing.sales_rank, "asc", True),
+    "reviews": (Listing.review_count, "desc", True),
+    "title": (Listing.title, "asc", False),
 }
 
 
@@ -130,33 +131,41 @@ def _parse(column, value: Any) -> Any:
 
 
 def paginate(db: Session, stmt: Select, sort: str, cursor: str | None, limit: int) -> tuple[list[Listing], str | None]:
+    """Keyset pagination on (sort column, id) using row-value comparisons, which
+    PostgreSQL serves straight from the (organisation_id, column, id) indexes.
+
+    Rows whose sort value is NULL (e.g. no price) are returned after all non-NULL
+    rows, in id order, as a second phase - never skipped and never duplicated."""
     if sort not in SORTS:
         raise AppError(f"Unknown sort {sort!r}; use one of {', '.join(SORTS)}", code="invalid_sort")
-    column, direction = SORTS[sort]
+    column, direction, nullable = SORTS[sort]
+    asc = direction == "asc"
     c = decode_cursor(cursor)
-    if c is not None:
-        if c.get("s") != sort:
-            raise AppError("Cursor does not match the requested sort", code="invalid_cursor")
-        last_value, last_id = _parse(column, c.get("v")), int(c["id"])
-        # NULLs sort last in both directions; keyset across the NULL boundary explicitly.
-        if last_value is None:
-            stmt = stmt.where(column.is_(None), Listing.id < last_id)
-        elif direction == "asc":
-            stmt = stmt.where(
-                or_(column > last_value, and_(column == last_value, Listing.id < last_id), column.is_(None))
-            )
-        else:
-            stmt = stmt.where(
-                or_(column < last_value, and_(column == last_value, Listing.id < last_id), column.is_(None))
-            )
-    order = column.asc().nulls_last() if direction == "asc" else column.desc().nulls_last()
-    rows = list(db.scalars(stmt.order_by(order, Listing.id.desc()).limit(limit + 1)).unique())
-    next_cursor = None
+    if c is not None and c.get("s") != sort:
+        raise AppError("Cursor does not match the requested sort", code="invalid_cursor")
+
+    rows: list[Listing] = []
+    in_null_phase = c is not None and c.get("n") is True
+    if not in_null_phase:
+        q = stmt.where(column.is_not(None)) if nullable else stmt
+        if c is not None:
+            key = tuple_(column, Listing.id)
+            bound = tuple_(literal(_parse(column, c["v"]), column.type), literal(int(c["id"])))
+            q = q.where(key > bound if asc else key < bound)
+        order = (column.asc(), Listing.id.asc()) if asc else (column.desc(), Listing.id.desc())
+        rows = list(db.scalars(q.order_by(*order).limit(limit + 1)).unique())
+        if len(rows) > limit:
+            last = rows[limit - 1]
+            return rows[:limit], encode_cursor({"s": sort, "v": _serialise(getattr(last, column.key)), "id": last.id})
+        if not nullable:
+            return rows, None
+    after_id = int(c["id"]) if in_null_phase and c is not None else 0
+    q = stmt.where(column.is_(None), Listing.id > after_id).order_by(Listing.id.asc())
+    rows += list(db.scalars(q.limit(limit - len(rows) + 1)).unique())
     if len(rows) > limit:
-        rows = rows[:limit]
-        last = rows[-1]
-        next_cursor = encode_cursor({"s": sort, "v": _serialise(getattr(last, column.key)), "id": last.id})
-    return rows, next_cursor
+        last = rows[limit - 1]
+        return rows[:limit], encode_cursor({"s": sort, "n": True, "id": last.id})
+    return rows, None
 
 
 def estimate_count(db: Session, stmt: Select, exact_threshold: int = 10_000) -> tuple[int, bool]:

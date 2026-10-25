@@ -183,8 +183,15 @@ CREATE INDEX idx_listing_canonical ON marketplace_listings (canonical_product_id
 CREATE INDEX idx_listing_marketplace_category ON marketplace_listings (organisation_id, marketplace_id, category_path);
 CREATE INDEX idx_listing_sku ON marketplace_listings (organisation_id, seller_sku);
 CREATE INDEX idx_listing_gtin ON marketplace_listings (organisation_id, gtin) WHERE gtin IS NOT NULL;
-CREATE INDEX idx_listing_price ON marketplace_listings (organisation_id, currency_code, current_price, id);
-CREATE INDEX idx_listing_updated ON marketplace_listings (organisation_id, updated_at DESC, id DESC);
+-- Sort/keyset indexes: (organisation, sort column, id) serve both directions.
+CREATE INDEX idx_listing_price ON marketplace_listings (organisation_id, current_price, id);
+CREATE INDEX idx_listing_currency_price ON marketplace_listings (organisation_id, currency_code, current_price, id);
+CREATE INDEX idx_listing_rank ON marketplace_listings (organisation_id, sales_rank, id);
+CREATE INDEX idx_listing_reviews ON marketplace_listings (organisation_id, review_count, id);
+CREATE INDEX idx_listing_title_sort ON marketplace_listings (organisation_id, title, id);
+CREATE INDEX idx_listing_updated ON marketplace_listings (organisation_id, updated_at, id);
+CREATE INDEX idx_listing_brand ON marketplace_listings (organisation_id, lower(brand));
+CREATE INDEX idx_listing_category_trgm ON marketplace_listings USING GIN (category_path gin_trgm_ops);
 CREATE INDEX idx_listing_refresh ON marketplace_listings (organisation_id, last_seen_at) WHERE source_type <> 'own_account';
 CREATE INDEX idx_listing_search ON marketplace_listings USING GIN (search_vector);
 CREATE INDEX idx_listing_title_trgm ON marketplace_listings USING GIN (title gin_trgm_ops);
@@ -586,3 +593,29 @@ CREATE TABLE connector_health (
     rate_limited_until TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ------------------------------------------------ dashboard pre-aggregation
+-- Refreshed CONCURRENTLY by a scheduled task; large organisations read the
+-- dashboard from here instead of aggregating millions of rows per request.
+CREATE MATERIALIZED VIEW mv_listing_summary AS
+SELECT l.organisation_id,
+       l.marketplace_id,
+       l.source_type,
+       coalesce(l.stock_status, 'unknown') AS stock_status,
+       l.currency_code,
+       CASE WHEN l.current_price IS NULL THEN NULL
+            WHEN l.current_price < 10 THEN '0-10' WHEN l.current_price < 25 THEN '10-25'
+            WHEN l.current_price < 50 THEN '25-50' WHEN l.current_price < 100 THEN '50-100'
+            WHEN l.current_price < 250 THEN '100-250' WHEN l.current_price < 500 THEN '250-500'
+            ELSE '500+' END AS price_band,
+       coalesce(l.category_path, 'Uncategorised') AS category_path,
+       count(*) AS listings,
+       sum(l.current_price) AS price_sum,
+       count(l.current_price) AS priced,
+       count(*) FILTER (WHERE l.last_changed_at >= now() - interval '1 day') AS changed_24h,
+       count(*) FILTER (WHERE l.last_seen_at < now() - interval '7 days') AS stale_7d,
+       now() AS refreshed_at
+FROM marketplace_listings l
+GROUP BY 1, 2, 3, 4, 5, 6, 7;
+CREATE UNIQUE INDEX uq_mv_listing_summary ON mv_listing_summary
+    (organisation_id, marketplace_id, source_type, stock_status, currency_code, price_band, category_path) NULLS NOT DISTINCT;

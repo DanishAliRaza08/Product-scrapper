@@ -1,0 +1,83 @@
+# Local development stack: PostgreSQL, Redis, API, worker, scheduler and the web dashboard.
+#   docker compose up --build
+#   docker compose exec api python -m scripts.seed_demo
+x-backend: &backend
+  build: ./backend
+  env_file:
+    - path: ./backend/.env
+      required: false
+  environment:
+    MPI_DATABASE_URL: postgresql+psycopg://mpi:mpi@db:5432/mpi
+    MPI_REDIS_URL: redis://redis:6379/0
+    MPI_STORAGE_DIR: /data/storage
+    MPI_SECRETS_DIR: /data/secrets
+  volumes:
+    - appdata:/data
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_started
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mpi
+      POSTGRES_PASSWORD: mpi
+      POSTGRES_DB: mpi
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mpi"]
+      interval: 5s
+      retries: 10
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    <<: *backend
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "jobs,exports,celery", "--concurrency", "4",
+              "--loglevel", "INFO"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  beat:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "--loglevel", "INFO",
+              "--schedule", "/data/celerybeat-schedule"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build: ./web
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  appdata:
